@@ -40,6 +40,7 @@
  *   - ANSI code page 1252 instead of UTF-8 for the game's code page APIs.
  *   - Post processing rules for tracks/<track>/effects.xml, text and binary.
  *   - Track surface LOD distance (tracks/tracklodsettings.xml, 30 m in the game).
+ *   - The bonus codes of this grid.exe are written to the log (see log_bonus_codes).
  */
 
 #include <windows.h>
@@ -899,6 +900,102 @@ static const char* find_redirect(const char* path)
     return result;
 }
 
+// --------------------------------------------------------------------------------------------
+// Bonus codes (Options -> Bonus codes)
+// --------------------------------------------------------------------------------------------
+// The check (0x4DF110 in the Steam grid.exe) compares the entered text with a table of fixed codes
+// that differs between builds/regions, and unlocks bonus id "base + index" (10..15):
+//     mov eax,[esi*4+table]; push eax; push ebp; call strcmp; test eax,eax; je found;
+//     add esi,1; cmp esi,count; jb loop  ...  found: ... add esi,base
+// Bonus ids 1..9 only come from 14-character codes signed with the publisher's RSA key ("PUBK"
+// blob); those were individual promotional codes and are not stored in the game.
+// The table is located by this instruction pattern once .text has been decrypted by the Steam
+// stub, i.e. on the first file access of the game.
+
+static volatile LONG g_bonusCodesState; // 0 = not yet, 1 = busy, 2 = done
+static int g_bonusCodesAttempts;
+
+static bool readable_string(const BYTE* p, const BYTE* lo, const BYTE* hi, char* out, size_t cap)
+{
+    size_t n = 0;
+    for (; p + n < hi && n + 1 < cap; ++n) {
+        BYTE c = p[n];
+        if (c == 0) break;
+        if (c < 0x20 || c > 0x7E) return false;
+        out[n] = char(c);
+    }
+    out[n] = 0;
+    return p >= lo && n >= 4 && p + n < hi;
+}
+
+static bool scan_bonus_codes();
+
+static void log_bonus_codes()
+{
+    if (g_bonusCodesState != 0 || InterlockedCompareExchange(&g_bonusCodesState, 1, 0) != 0) {
+        return;
+    }
+    if (scan_bonus_codes() || ++g_bonusCodesAttempts >= 3) {
+        if (g_bonusCodesAttempts >= 3) {
+            logf("Bonus codes: check not found in this grid.exe");
+        }
+        InterlockedExchange(&g_bonusCodesState, 2);
+    } else {
+        InterlockedExchange(&g_bonusCodesState, 0);
+    }
+}
+
+static bool scan_bonus_codes()
+{
+    BYTE* base = (BYTE*)GetModuleHandleA(nullptr);
+    auto nt = PIMAGE_NT_HEADERS(base + PIMAGE_DOS_HEADER(base)->e_lfanew);
+    BYTE* imageEnd = base + nt->OptionalHeader.SizeOfImage;
+    auto sec = IMAGE_FIRST_SECTION(nt);
+
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+        if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) || strncmp((const char*)sec->Name, ".bind", 5) == 0) {
+            continue;
+        }
+        BYTE* p = base + sec->VirtualAddress;
+        BYTE* end = p + sec->Misc.VirtualSize - 32;
+        for (; p < end; ++p) {
+            // 8B 04 B5 <table> 50 55 E8 <rel32> 85 C0 74 <d8> 83 C6 01 83 FE <count> 72
+            if (p[0] != 0x8B || p[1] != 0x04 || p[2] != 0xB5 || p[7] != 0x50 || p[8] != 0x55 || p[9] != 0xE8 ||
+                p[14] != 0x85 || p[15] != 0xC0 || p[16] != 0x74 || p[18] != 0x83 || p[19] != 0xC6 || p[20] != 0x01 ||
+                p[21] != 0x83 || p[22] != 0xFE || p[24] != 0x72) {
+                continue;
+            }
+            BYTE** table = *(BYTE***)(p + 3);
+            int count = p[23];
+            BYTE* found = p + 18 + (signed char)p[17];
+            int idBase = -1;
+            for (int k = 0; k < 12 && found + k + 2 < imageEnd; ++k) {
+                if (found[k] == 0x83 && found[k + 1] == 0xC6) { // add esi, imm8
+                    idBase = found[k + 2];
+                    break;
+                }
+            }
+            if ((BYTE*)table < base || (BYTE*)(table + count) > imageEnd || count <= 0 || count > 32) {
+                continue;
+            }
+            logf("Bonus codes of this grid.exe (check at %p, table at %p, %d codes):", p, table, count);
+            for (int k = 0; k < count; ++k) {
+                char code[64];
+                if (table[k] >= base && table[k] < imageEnd && readable_string(table[k], base, imageEnd, code, sizeof(code))) {
+                    if (idBase >= 0) {
+                        logf("  %-12s -> bonus %d", code, idBase + k);
+                    } else {
+                        logf("  %s", code);
+                    }
+                }
+            }
+            logf("  bonus 1..9: 14-character codes signed with the publisher's key (PUBK), not stored in the game");
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool to_narrow(const WCHAR* path, char* out, int cap)
 {
     return WideCharToMultiByte(CP_ACP, 0, path, -1, out, cap, nullptr, nullptr) != 0;
@@ -911,6 +1008,7 @@ static decltype(&FindFirstFileA) real_FindFirstFileA;
 static HANDLE WINAPI hook_CreateFileA(LPCSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disposition,
                                       DWORD flags, HANDLE templ)
 {
+    log_bonus_codes();
     if (name && !(access & GENERIC_WRITE)) {
         if (const char* to = find_redirect(name)) {
             logf("CreateFileA(%s) -> %s", name, to);
@@ -923,6 +1021,7 @@ static HANDLE WINAPI hook_CreateFileA(LPCSTR name, DWORD access, DWORD share, LP
 static HANDLE WINAPI hook_CreateFileW(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disposition,
                                       DWORD flags, HANDLE templ)
 {
+    log_bonus_codes();
     char narrow[MAX_PATH * 2];
     if (name && !(access & GENERIC_WRITE) && to_narrow(name, narrow, sizeof(narrow))) {
         if (const char* to = find_redirect(narrow)) {
